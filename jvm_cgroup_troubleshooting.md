@@ -1,14 +1,16 @@
-## Possible Causes of cgroup Detection Failure
+# JVM cgroup v2 Workaround
 
-JVM may fail to initialize container metrics when it cannot correctly detect or access the Linux cgroup configuration.
+## Problem
 
-Common causes include:
+In some Docker environments using **cgroup v2**, the JVM may fail while detecting container CPU/memory information.
 
-### 1. Old JVM with cgroup v2 incompatibility
+The application can fail during Spring Boot startup with errors similar to:
 
-Older OpenJDK versions may have bugs or incomplete support for cgroup v2.
+```text
+java.lang.InternalError: java.lang.reflect.InvocationTargetException
+```
 
-Typical error:
+and:
 
 ```text
 java.lang.NullPointerException:
@@ -16,139 +18,108 @@ Cannot invoke "jdk.internal.platform.CgroupInfo.getMountPoint()"
 because "anyController" is null
 ```
 
-The failure occurs in:
+The error is usually triggered while Spring Boot Actuator initializes system or Tomcat metrics:
 
 ```text
-jdk.internal.platform.cgroupv2.CgroupV2Subsystem
-```
-
-### 2. Missing cgroup controllers
-
-Required controllers such as:
-
-```text
-cpu
-memory
-cpuset
-io
-pids
-```
-
-may not be available or enabled.
-
-Check:
-
-```bash
-cat /sys/fs/cgroup/cgroup.controllers
-```
-
-### 3. Incorrect or incomplete cgroup mount
-
-Check:
-
-```bash
-mount | grep cgroup
-```
-
-For cgroup v2, the expected filesystem is:
-
-```text
-cgroup2 on /sys/fs/cgroup type cgroup2
-```
-
-Also check:
-
-```bash
-ls -la /sys/fs/cgroup/
-```
-
-### 4. cgroup namespace configuration
-
-Docker can expose a different cgroup namespace to the container.
-
-Check:
-
-```bash
-docker inspect <container> \
-  --format '{{.HostConfig.CgroupnsMode}}'
-```
-
-For example:
-
-```text
-host
-```
-
-or:
-
-```text
-private
-```
-
-An unusual namespace configuration can expose cgroup information differently than expected by an older JVM.
-
-### 5. Host/Container cgroup version mismatch
-
-The host may use cgroup v2 while the application/JVM was designed or tested primarily with cgroup v1.
-
-Check the host:
-
-```bash
-stat -fc %T /sys/fs/cgroup/
-```
-
-Result:
-
-```text
-cgroup2fs
-```
-
-indicates cgroup v2.
-
-### 6. Missing or inaccessible cgroup information inside the container
-
-Check from inside the container:
-
-```bash
-docker exec <container> sh -c '
-mount | grep cgroup
-ls -la /sys/fs/cgroup/
-cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null
-'
-```
-
-If the JVM cannot access the expected cgroup information, container metrics initialization may fail.
-
-### 7. JVM container-awareness bug
-
-The failure can occur before the application itself starts, when Java initializes:
-
-```text
+ProcessorMetrics
+    ↓
 OperatingSystemMXBean
-        ↓
+    ↓
 Container.metrics()
-        ↓
+    ↓
 CgroupV2Subsystem
+    ↓
+NullPointerException
 ```
 
-In this situation, Spring Boot/Tomcat is only exposing the JVM problem through Micrometer.
+## Configuration
 
-## Workaround
-
-When upgrading the JVM is not immediately possible:
+The following configuration can be used as a workaround:
 
 ```yaml
 environment:
   JAVA_OPTS: "-XX:-UseContainerSupport"
+  SPRING_AUTOCONFIGURE_EXCLUDE: org.springframework.boot.actuate.autoconfigure.metrics.SystemMetricsAutoConfiguration
+  MANAGEMENT_METRICS_BINDERS_TOMCAT_ENABLED: "false"
 ```
 
-This disables JVM container-awareness and bypasses the problematic cgroup detection code.
+### JAVA_OPTS
 
-Docker CPU/memory limits remain enforced by Docker itself.
+```yaml
+JAVA_OPTS: "-XX:-UseContainerSupport"
+```
 
-For example:
+Disables JVM container-awareness.
+
+This prevents the affected JVM from trying to read Docker/cgroup information through the problematic cgroup v2 implementation.
+
+> This does **not** disable Docker CPU or memory limits. Docker continues to enforce the container limits.
+
+If the application already has JVM options, append the flag instead of replacing the existing options. For example:
+
+```yaml
+JAVA_OPTS: "-Xms5g -Xmx5g -XX:-UseContainerSupport"
+```
+
+### SPRING_AUTOCONFIGURE_EXCLUDE
+
+```yaml
+SPRING_AUTOCONFIGURE_EXCLUDE: org.springframework.boot.actuate.autoconfigure.metrics.SystemMetricsAutoConfiguration
+```
+
+Prevents Spring Boot Actuator from automatically configuring the system metrics components, including `ProcessorMetrics`.
+
+### MANAGEMENT_METRICS_BINDERS_TOMCAT_ENABLED
+
+```yaml
+MANAGEMENT_METRICS_BINDERS_TOMCAT_ENABLED: "false"
+```
+
+Disables the Tomcat metrics binder.
+
+This prevents Micrometer from registering Tomcat-specific metrics.
+
+## Recommended Configuration
+
+For an application affected by the JVM/cgroup v2 issue:
 
 ```yaml
 environment:
   JAVA_OPTS: "-Xms5g -Xmx5g -XX:-UseContainerSupport"
+  SPRING_AUTOCONFIGURE_EXCLUDE: org.springframework.boot.actuate.autoconfigure.metrics.SystemMetricsAutoConfiguration
+  MANAGEMENT_METRICS_BINDERS_TOMCAT_ENABLED: "false"
 ```
+
+## Verification
+
+After updating the Compose file, recreate the container:
+
+```bash
+docker-compose up -d --force-recreate <service-name>
+```
+
+Verify that the JVM option is applied:
+
+```bash
+docker exec <container-name> sh -c 'ps aux | grep "[j]ava"'
+```
+
+The Java command should contain:
+
+```text
+-XX:-UseContainerSupport
+```
+
+Check application logs:
+
+```bash
+docker logs --tail 200 <container-name>
+```
+
+The application should start without the `CgroupV2Subsystem` / `ProcessorMetrics` initialization error.
+
+## Important
+
+These settings are a **workaround** for JVM/cgroup compatibility issues.
+
+They should not be considered a replacement for upgrading an affected JVM when a compatible Java version becomes available.
